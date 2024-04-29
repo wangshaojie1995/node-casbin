@@ -49,12 +49,25 @@ test('test keyMatchFunc', () => {
   expect(util.keyMatchFunc('/bar/foo', '/foo/*')).toEqual(false);
 });
 
+test('test keyGetFunc', () => {
+  expect(util.keyGetFunc('/foo/bar', '/foo/*')).toEqual('bar');
+  expect(util.keyGetFunc('/bar/foo', '/foo/*')).toEqual('');
+});
+
 test('test keyMatch2Func', () => {
   expect(util.keyMatch2Func('/foo/bar', '/foo/*')).toEqual(true);
   expect(util.keyMatch2Func('/foo/baz', '/foo/:bar')).toEqual(true);
   expect(util.keyMatch2Func('/foo/baz/foo', '/foo/:bar/foo')).toEqual(true);
   expect(util.keyMatch2Func('/baz', '/foo')).toEqual(false);
   expect(util.keyMatch2Func('/foo/baz', '/foo')).toEqual(false);
+});
+
+test('test keyGet2Func', () => {
+  expect(util.keyGet2Func('/foo/bar', '/foo/*', 'bar')).toEqual('');
+  expect(util.keyGet2Func('/foo/baz', '/foo/:bar', 'bar')).toEqual('baz');
+  expect(util.keyGet2Func('/foo/baz/foo', '/foo/:bar/foo', 'bar')).toEqual('baz');
+  expect(util.keyGet2Func('/baz', '/foo', 'bar')).toEqual('');
+  expect(util.keyGet2Func('/foo/baz', '/foo', 'bar')).toEqual('');
 });
 
 test('test keyMatch3Func', () => {
@@ -77,6 +90,48 @@ test('test keyMatch4Func', () => {
   expect(util.keyMatch4Func('/parent/123/child/456/book/123', '/parent/{id}/child/{id}/book/{id}')).toEqual(false);
   expect(util.keyMatch4Func('/parent/123/child/456/book/', '/parent/{id}/child/{id}/book/{id}')).toEqual(false);
   expect(util.keyMatch4Func('/parent/123/child/456', '/parent/{id}/child/{id}/book/{id}')).toEqual(false);
+});
+
+test('test keyMatch5Func', () => {
+  expect(util.keyMatch5Func('/parent/child?status=1&type=2', '/parent/child')).toEqual(true);
+  expect(util.keyMatch5Func('/parent?status=1&type=2', '/parent/child')).toEqual(false);
+
+  expect(util.keyMatch5Func('/parent/child/?status=1&type=2', '/parent/child/')).toEqual(true);
+  expect(util.keyMatch5Func('/parent/child/?status=1&type=2', '/parent/child')).toEqual(false);
+  expect(util.keyMatch5Func('/parent/child?status=1&type=2', '/parent/child/')).toEqual(false);
+
+  expect(util.keyMatch5Func('keyMatch5: expected 2 arguments, but got 1', '/foo')).toEqual(false);
+  expect(util.keyMatch5Func('keyMatch5: expected 2 arguments, but got 3', '/foo/create/123', '/foo/*', '/foo/update/123')).toEqual(false);
+  expect(util.keyMatch5Func('keyMatch5: argument must be a string', '/parent/123', true)).toEqual(false);
+
+  expect(util.keyMatch5Func('/foo', '/foo')).toEqual(true);
+  expect(util.keyMatch5Func('/foo', '/foo*')).toEqual(true);
+  expect(util.keyMatch5Func('/foo', '/foo/*')).toEqual(false);
+  expect(util.keyMatch5Func('/foo/bar', '/foo')).toEqual(false);
+  expect(util.keyMatch5Func('/foo/bar', '/foo*')).toEqual(false);
+  expect(util.keyMatch5Func('/foo/bar', '/foo/*')).toEqual(true);
+  expect(util.keyMatch5Func('/foobar', '/foo')).toEqual(false);
+  expect(util.keyMatch5Func('/foobar', '/foo*')).toEqual(false);
+  expect(util.keyMatch5Func('/foobar', '/foo/*')).toEqual(false);
+
+  expect(util.keyMatch5Func('/', '/{resource}')).toEqual(false);
+  expect(util.keyMatch5Func('/resource1', '/{resource}')).toEqual(true);
+  expect(util.keyMatch5Func('/myid', '/{id}/using/{resId}')).toEqual(false);
+  expect(util.keyMatch5Func('/myid/using/myresid', '/{id}/using/{resId}')).toEqual(true);
+
+  expect(util.keyMatch5Func('/proxy/myid', '/proxy/{id}/*')).toEqual(false);
+  expect(util.keyMatch5Func('/proxy/myid/', '/proxy/{id}/*')).toEqual(true);
+  expect(util.keyMatch5Func('/proxy/myid/res', '/proxy/{id}/*')).toEqual(true);
+  expect(util.keyMatch5Func('/proxy/myid/res/res2', '/proxy/{id}/*')).toEqual(true);
+  expect(util.keyMatch5Func('/proxy/myid/res/res2/res3', '/proxy/{id}/*')).toEqual(true);
+  expect(util.keyMatch5Func('/proxy/', '/proxy/{id}/*')).toEqual(false);
+
+  expect(util.keyMatch5Func('/proxy/myid?status=1&type=2', '/proxy/{id}/*')).toEqual(false);
+  expect(util.keyMatch5Func('/proxy/myid/', '/proxy/{id}/*')).toEqual(true);
+  expect(util.keyMatch5Func('/proxy/myid/res?status=1&type=2', '/proxy/{id}/*')).toEqual(true);
+  expect(util.keyMatch5Func('/proxy/myid/res/res2?status=1&type=2', '/proxy/{id}/*')).toEqual(true);
+  expect(util.keyMatch5Func('/proxy/myid/res/res2/res3?status=1&type=2', '/proxy/{id}/*')).toEqual(true);
+  expect(util.keyMatch5Func('/proxy/', '/proxy/{id}/*')).toEqual(false);
 });
 
 test('test ipMatchFunc', () => {
@@ -134,9 +189,12 @@ test('test globMatch', () => {
   expect(util.globMatch('/prefix/subprefix/foobar', '*/foo')).toEqual(false);
   expect(util.globMatch('/prefix/subprefix/foobar', '*/foo*')).toEqual(false);
   expect(util.globMatch('/prefix/subprefix/foobar', '*/foo/*')).toEqual(false);
+
+  expect(util.globMatch('a.conf', '*.conf')).toEqual(true);
 });
 
 test('test hasEval', () => {
+  expect(util.hasEval('eval() && a && b && c')).toEqual(true);
   expect(util.hasEval('eval() && a && b && c')).toEqual(true);
   expect(util.hasEval('eval) && a && b && c')).toEqual(false);
   expect(util.hasEval('eval)( && a && b && c')).toEqual(false);
@@ -145,8 +203,12 @@ test('test hasEval', () => {
 });
 
 test('test replaceEval', () => {
-  expect(util.replaceEval('eval() && a && b && c', 'a')).toEqual('(a) && a && b && c');
-  expect(util.replaceEval('eval() && a && b && c', '(a)')).toEqual('((a)) && a && b && c');
+  expect(util.replaceEval('eval() && a && b && c', '', 'a')).toEqual('(a) && a && b && c');
+  expect(util.replaceEval('eval() && a && b && c', '', '(a)')).toEqual('((a)) && a && b && c');
+  expect(util.replaceEval('eval(p_some_rule) && c', 'p_some_rule', '(a)')).toEqual('((a)) && c');
+  expect(util.replaceEval('eval(p_some_rule) && eval(p_some_other_rule) && c', 'p_some_rule', '(a)')).toEqual(
+    '((a)) && eval(p_some_other_rule) && c'
+  );
 });
 
 test('test getEvalValue', () => {
@@ -154,4 +216,15 @@ test('test getEvalValue', () => {
   expect(util.arrayEquals(util.getEvalValue('a && eval(a) && b && c'), ['a']));
   expect(util.arrayEquals(util.getEvalValue('eval(a) && eval(b) && a && b && c'), ['a', 'b']));
   expect(util.arrayEquals(util.getEvalValue('a && eval(a) && eval(b) && b && c'), ['a', 'b']));
+});
+
+test('bracketCompatible', () => {
+  expect(util.bracketCompatible("g(r.sub, p.sub) && r.obj == p.obj && r.act == p.act || r.obj in ('data2', 'data3')")).toEqual(
+    "g(r.sub, p.sub) && r.obj == p.obj && r.act == p.act || r.obj in ['data2', 'data3']"
+  );
+  expect(
+    util.bracketCompatible(
+      "g(r.sub, p.sub) && r.obj == p.obj && r.act == p.act || r.obj in ('data2', 'data3') || r.obj in ('data4', 'data5')"
+    )
+  ).toEqual("g(r.sub, p.sub) && r.obj == p.obj && r.act == p.act || r.obj in ['data2', 'data3'] || r.obj in ['data4', 'data5']");
 });

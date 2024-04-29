@@ -1,4 +1,4 @@
-// Copyright 2019 The Casbin Authors. All Rights Reserved.
+// Copyright 2023 The Casbin Authors. All Rights Reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,18 +12,4 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-import * as Util from './util';
-import { setDefaultFileSystem } from './persist';
-
-export * from './config';
-export * from './enforcer';
-export * from './cachedEnforcer';
-export * from './syncedEnforcer';
-export * from './effect';
-export * from './model';
-export * from './persist';
-export * from './rbac';
-export * from './log';
-export * from './enforceContext';
-export * from './frontend';
-export { Util };
+declare const __non_webpack_require__: NodeRequireFunction;

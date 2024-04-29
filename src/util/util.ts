@@ -12,13 +12,17 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-import * as fs from 'fs';
-
 // escapeAssertion escapes the dots in the assertion,
 // because the expression evaluation doesn't support such variable names.
+
+import { mustGetDefaultFileSystem } from '../persist';
+
+const escapeAssertionReg = new RegExp(/(^|[^A-Za-z0-9_])([rp])[0-9]*\./g);
+
 function escapeAssertion(s: string): string {
-  s = s.replace(/r\./g, 'r_');
-  s = s.replace(/p\./g, 'p_');
+  s = s.replace(escapeAssertionReg, (match, p1, p2) => {
+    return p1 + p2 + match.substring(p1.length + p2.length).replace('.', '_');
+  });
   return s;
 }
 
@@ -82,29 +86,32 @@ function setEquals(a: string[], b: string[]): boolean {
 
 // readFile return a promise for readFile.
 function readFile(path: string, encoding?: string): any {
+  const fs = mustGetDefaultFileSystem();
   return new Promise((resolve, reject) => {
-    fs.readFile(path, encoding || 'utf8', (error, data) => {
-      if (error) {
-        reject(error);
-      }
-      resolve(data);
-    });
+    try {
+      fs.readFileSync(path, encoding || 'utf8');
+      resolve();
+    } catch (e) {
+      reject(e);
+    }
   });
 }
 
 // writeFile return a promise for writeFile.
 function writeFile(path: string, file: string, encoding?: string): any {
+  const fs = mustGetDefaultFileSystem();
   return new Promise((resolve, reject) => {
-    fs.writeFile(path, file, encoding || 'utf8', (error) => {
-      if (error) {
-        reject(error);
-      }
-      resolve(true);
-    });
+    try {
+      fs.writeFileSync(path, file, encoding || 'utf-8');
+      resolve();
+    } catch (e) {
+      reject(e);
+    }
   });
 }
 
-const evalReg = new RegExp(/\beval\(([^),]*)\)/g);
+const evalRegG = new RegExp(/\beval\(([^),]*)\)/g);
+const evalReg = new RegExp(/\beval\(([^),]*)\)/);
 
 // hasEval determine whether matcher contains function eval
 function hasEval(s: string): boolean {
@@ -112,13 +119,13 @@ function hasEval(s: string): boolean {
 }
 
 // replaceEval replace function eval with the value of its parameters
-function replaceEval(s: string, rule: string): string {
-  return s.replace(evalReg, '(' + rule + ')');
+function replaceEval(s: string, ruleName: string, rule: string): string {
+  return s.replace(`eval(${ruleName})`, '(' + rule + ')');
 }
 
 // getEvalValue returns the parameters of function eval
 function getEvalValue(s: string): string[] {
-  const subMatch = s.match(evalReg);
+  const subMatch = s.match(evalRegG);
   const rules: string[] = [];
   if (!subMatch) {
     return [];
@@ -170,6 +177,34 @@ function deepCopy(obj: Array<any> | any): any {
   return newObj;
 }
 
+function customIn(a: number | string, b: number | string): number {
+  if ((b as any) instanceof Array) {
+    return (((b as any) as Array<any>).includes(a) as unknown) as number;
+  }
+  return ((a in (b as any)) as unknown) as number;
+}
+
+function bracketCompatible(exp: string): string {
+  // TODO: This function didn't support nested bracket.
+  if (!(exp.includes(' in ') && exp.includes(' ('))) {
+    return exp;
+  }
+
+  const re = / \([^)]*\)/g;
+  const array = exp.split('');
+
+  let reResult: RegExpExecArray | null;
+  while ((reResult = re.exec(exp)) !== null) {
+    if (!(reResult[0] as string).includes(',')) {
+      continue;
+    }
+    array[reResult.index + 1] = '[';
+    array[re.lastIndex - 1] = ']';
+  }
+  exp = array.join('');
+  return exp;
+}
+
 export {
   escapeAssertion,
   removeComments,
@@ -187,4 +222,6 @@ export {
   generatorRunSync,
   generatorRunAsync,
   deepCopy,
+  customIn,
+  bracketCompatible,
 };

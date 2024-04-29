@@ -12,15 +12,30 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-import { compile, compileAsync } from 'expression-eval';
+import { compile, compileAsync, addBinaryOp } from 'expression-eval';
 
 import { DefaultEffector, Effect, Effector } from './effect';
-import { FunctionMap, Model, newModel, PolicyOp } from './model';
-import { Adapter, FilteredAdapter, Watcher, BatchAdapter, UpdatableAdapter } from './persist';
+import { FunctionMap, Model, newModelFromFile, PolicyOp } from './model';
+import { Adapter, FilteredAdapter, Watcher, BatchAdapter, UpdatableAdapter, WatcherEx } from './persist';
 import { DefaultRoleManager, RoleManager } from './rbac';
-import { escapeAssertion, generateGFunction, getEvalValue, hasEval, replaceEval, generatorRunSync, generatorRunAsync } from './util';
+import { EnforceContext } from './enforceContext';
+
+import {
+  escapeAssertion,
+  generateGFunction,
+  generateSyncedGFunction,
+  getEvalValue,
+  hasEval,
+  replaceEval,
+  generatorRunSync,
+  generatorRunAsync,
+  customIn,
+  bracketCompatible,
+  removeComments,
+} from './util';
 import { getLogger, logPrint } from './log';
 import { MatchingFunc } from './rbac';
+import { FileSystem, getDefaultFileSystem } from './persist';
 
 type Matcher = ((context: any) => Promise<any>) | ((context: any) => any);
 
@@ -35,21 +50,42 @@ export class CoreEnforcer {
   protected fm: FunctionMap = FunctionMap.loadFunctionMap();
   protected eft: Effector = new DefaultEffector();
   private matcherMap: Map<string, Matcher> = new Map();
+  private defaultEnforceContext: EnforceContext = new EnforceContext('r', 'p', 'e', 'm');
 
   protected adapter: UpdatableAdapter | FilteredAdapter | Adapter | BatchAdapter;
   protected watcher: Watcher | null = null;
-  protected rmMap: Map<string, RoleManager> = new Map<string, RoleManager>([['g', new DefaultRoleManager(10)]]);
+  protected watcherEx: WatcherEx | null = null;
+  protected rmMap: Map<string, RoleManager>;
 
   protected enabled = true;
   protected autoSave = true;
   protected autoBuildRoleLinks = true;
   protected autoNotifyWatcher = true;
+  protected fs?: FileSystem;
+
+  /**
+   * setFileSystem sets a file system to read the model file or the policy file.
+   * @param fs {@link FileSystem}
+   */
+  public setFileSystem(fs: FileSystem): void {
+    this.fs = fs;
+  }
+
+  /**
+   * getFileSystem gets the file system,
+   */
+  public getFileSystem(): FileSystem | undefined {
+    return this.fs;
+  }
 
   private getExpression(asyncCompile: boolean, exp: string): Matcher {
     const matcherKey = `${asyncCompile ? 'ASYNC[' : 'SYNC['}${exp}]`;
 
+    addBinaryOp('in', 1, customIn);
+
     let expression = this.matcherMap.get(matcherKey);
     if (!expression) {
+      exp = bracketCompatible(exp);
       expression = asyncCompile ? compileAsync(exp) : compile(exp);
       this.matcherMap.set(matcherKey, expression);
     }
@@ -62,8 +98,7 @@ export class CoreEnforcer {
    * so the policy is invalidated and needs to be reloaded by calling LoadPolicy().
    */
   public loadModel(): void {
-    this.model = newModel();
-    this.model.loadModel(this.modelPath);
+    this.model = newModelFromFile(this.modelPath, this.fs);
     this.model.printModel();
   }
 
@@ -114,12 +149,31 @@ export class CoreEnforcer {
   }
 
   /**
+   * setWatcherEx sets the current watcherEx.
+   *
+   * @param watcherEx the watcherEx.
+   */
+  public setWatcherEx(watcherEx: WatcherEx): void {
+    this.watcherEx = watcherEx;
+  }
+
+  /**
    * setRoleManager sets the current role manager.
    *
    * @param rm the role manager.
    */
   public setRoleManager(rm: RoleManager): void {
     this.rmMap.set('g', rm);
+  }
+
+  /**
+   * setRoleManager sets the role manager for the named policy.
+   *
+   * @param ptype the named policy.
+   * @param rm the role manager.
+   */
+  public setNamedRoleManager(ptype: string, rm: RoleManager): void {
+    this.rmMap.set(ptype, rm);
   }
 
   /**
@@ -163,17 +217,18 @@ export class CoreEnforcer {
   }
 
   public sortPolicies(): void {
-    const policy = this.model.model.get('p')?.get('p')?.policy;
-    const tokens = this.model.model.get('p')?.get('p')?.tokens;
-
-    if (policy && tokens) {
-      const priorityIndex = tokens.indexOf('p_priority');
-      if (priorityIndex !== -1) {
-        policy.sort((a, b) => {
-          return parseInt(a[priorityIndex], 10) - parseInt(b[priorityIndex], 10);
-        });
+    this.model.model.get('p')?.forEach((value, key) => {
+      const policy = value.policy;
+      const tokens = value.tokens;
+      if (policy && tokens) {
+        const priorityIndex = tokens.indexOf(`${key}_priority`);
+        if (priorityIndex !== -1) {
+          policy.sort((a, b) => {
+            return parseInt(a[priorityIndex], 10) - parseInt(b[priorityIndex], 10);
+          });
+        }
       }
-    }
+    });
   }
 
   /**
@@ -184,8 +239,7 @@ export class CoreEnforcer {
     await this.adapter.loadPolicy(this.model);
 
     this.sortPolicies();
-
-    this.initRmMap();
+    this.model.sortPoliciesBySubjectHierarchy();
 
     if (this.autoBuildRoleLinks) {
       await this.buildRoleLinksInternal();
@@ -201,6 +255,19 @@ export class CoreEnforcer {
   public async loadFilteredPolicy(filter: any): Promise<boolean> {
     this.model.clearPolicy();
 
+    this.sortPolicies();
+    this.model.sortPoliciesBySubjectHierarchy();
+
+    return this.loadIncrementalFilteredPolicy(filter);
+  }
+
+  /**
+   * LoadIncrementalFilteredPolicy append a filtered policy from file/database.
+   *
+   * @param filter the filter used to specify which type of policy should be appended.
+   */
+  // eslint-disable-next-line @typescript-eslint/explicit-module-boundary-types
+  public async loadIncrementalFilteredPolicy(filter: any): Promise<boolean> {
     if ('isFiltered' in this.adapter) {
       await this.adapter.loadFilteredPolicy(this.model, filter);
     } else {
@@ -208,8 +275,6 @@ export class CoreEnforcer {
     }
 
     this.sortPolicies();
-
-    this.initRmMap();
 
     if (this.autoBuildRoleLinks) {
       await this.buildRoleLinksInternal();
@@ -241,7 +306,9 @@ export class CoreEnforcer {
     if (!flag) {
       return false;
     }
-    if (this.watcher) {
+    if (this.watcherEx) {
+      return await this.watcherEx.updateForSavePolicy(this.model);
+    } else if (this.watcher) {
       return await this.watcher.update();
     }
     return true;
@@ -349,7 +416,13 @@ export class CoreEnforcer {
     }
   }
 
-  private *privateEnforce(asyncCompile = true, explain = false, ...rvals: any[]): EnforceResult {
+  private *privateEnforce(
+    asyncCompile = true,
+    explain = false,
+    matcher: string,
+    enforceContext: EnforceContext = new EnforceContext('r', 'p', 'e', 'm'),
+    ...rvals: any[]
+  ): EnforceResult {
     if (!this.enabled) {
       return true;
     }
@@ -365,15 +438,22 @@ export class CoreEnforcer {
 
     astMap?.forEach((value, key) => {
       const rm = value.rm;
-      functions[key] = generateGFunction(rm);
+      functions[key] = asyncCompile ? generateGFunction(rm) : generateSyncedGFunction(rm);
     });
 
-    const expString = this.model.model.get('m')?.get('m')?.value;
+    let expString;
+
+    if (!matcher) {
+      expString = this.model.model.get('m')?.get(enforceContext.mType)?.value;
+    } else {
+      expString = removeComments(escapeAssertion(matcher));
+    }
+
     if (!expString) {
       throw new Error('Unable to find matchers in model');
     }
 
-    const effectExpr = this.model.model.get('e')?.get('e')?.value;
+    const effectExpr = this.model.model.get('e')?.get(enforceContext.eType)?.value;
     if (!effectExpr) {
       throw new Error('Unable to find policy_effect in model');
     }
@@ -381,10 +461,10 @@ export class CoreEnforcer {
     const HasEval: boolean = hasEval(expString);
     let expression: Matcher | undefined = undefined;
 
-    const p = this.model.model.get('p')?.get('p');
+    const p = this.model.model.get('p')?.get(enforceContext.pType);
     const policyLen = p?.policy?.length;
 
-    const rTokens = this.model.model.get('r')?.get('r')?.tokens;
+    const rTokens = this.model.model.get('r')?.get(enforceContext.rType)?.tokens;
     const rTokensLen = rTokens?.length;
 
     const effectStream = this.eft.newStream(effectExpr);
@@ -411,7 +491,7 @@ export class CoreEnforcer {
           for (const ruleName of ruleNames) {
             if (ruleName in parameters) {
               const rule = escapeAssertion(parameters[ruleName]);
-              expWithRule = replaceEval(expWithRule, rule);
+              expWithRule = replaceEval(expWithRule, ruleName, rule);
             } else {
               throw new Error(`${ruleName} not in ${parameters}`);
             }
@@ -438,11 +518,18 @@ export class CoreEnforcer {
               eftRes = result;
             }
             break;
+          case 'string':
+            if (result === '') {
+              eftRes = Effect.Indeterminate;
+            } else {
+              eftRes = Effect.Allow;
+            }
+            break;
           default:
-            throw new Error('matcher result should be boolean or number');
+            throw new Error('matcher result should only be of type boolean, number, or string');
         }
 
-        const eft = parameters['p_eft'];
+        const eft = parameters[`${enforceContext.pType}_eft`];
         if (eft && eftRes === Effect.Allow) {
           if (eft === 'allow') {
             eftRes = Effect.Allow;
@@ -453,10 +540,13 @@ export class CoreEnforcer {
           }
         }
 
-        const [res, done] = effectStream.pushEffect(eftRes);
+        const [res, rec, done] = effectStream.pushEffect(eftRes);
+
+        if (rec) {
+          explainIndex = i;
+        }
 
         if (done) {
-          explainIndex = i;
           break;
         }
       }
@@ -522,7 +612,11 @@ export class CoreEnforcer {
    * @return whether to allow the request.
    */
   public enforceSync(...rvals: any[]): boolean {
-    return generatorRunSync(this.privateEnforce(false, false, ...rvals));
+    if (rvals[0] instanceof EnforceContext) {
+      const enforceContext: EnforceContext = rvals.shift();
+      return generatorRunSync(this.privateEnforce(false, false, '', enforceContext, ...rvals));
+    }
+    return generatorRunSync(this.privateEnforce(false, false, '', this.defaultEnforceContext, ...rvals));
   }
 
   /**
@@ -536,7 +630,11 @@ export class CoreEnforcer {
    * @return whether to allow the request and the reason rule.
    */
   public enforceExSync(...rvals: any[]): [boolean, string[]] {
-    return generatorRunSync(this.privateEnforce(false, true, ...rvals));
+    if (rvals[0] instanceof EnforceContext) {
+      const enforceContext: EnforceContext = rvals.shift();
+      return generatorRunSync(this.privateEnforce(false, true, '', enforceContext, ...rvals));
+    }
+    return generatorRunSync(this.privateEnforce(false, true, '', this.defaultEnforceContext, ...rvals));
   }
 
   /**
@@ -555,7 +653,29 @@ export class CoreEnforcer {
    * @return whether to allow the request.
    */
   public async enforce(...rvals: any[]): Promise<boolean> {
-    return generatorRunAsync(this.privateEnforce(true, false, ...rvals));
+    if (rvals[0] instanceof EnforceContext) {
+      const enforceContext: EnforceContext = rvals.shift();
+      return generatorRunAsync(this.privateEnforce(true, false, '', enforceContext, ...rvals));
+    }
+    return generatorRunAsync(this.privateEnforce(true, false, '', this.defaultEnforceContext, ...rvals));
+  }
+
+  /**
+   * enforceWithMatcher decides whether a "subject" can access a "object" with
+   * the operation "action" but with the matcher passed,
+   * input parameters are usually: (matcher, sub, obj, act).
+   *
+   * @param matcher matcher string.
+   * @param rvals the request needs to be mediated, usually an array
+   *              of strings, can be class instances if ABAC is used.
+   * @return whether to allow the request.
+   */
+  public async enforceWithMatcher(matcher: string, ...rvals: any[]): Promise<boolean> {
+    if (rvals[0] instanceof EnforceContext) {
+      const enforceContext: EnforceContext = rvals.shift();
+      return generatorRunAsync(this.privateEnforce(true, false, matcher, enforceContext, ...rvals));
+    }
+    return generatorRunAsync(this.privateEnforce(true, false, matcher, this.defaultEnforceContext, ...rvals));
   }
 
   /**
@@ -567,6 +687,38 @@ export class CoreEnforcer {
    * @return whether to allow the request and the reason rule.
    */
   public async enforceEx(...rvals: any[]): Promise<[boolean, string[]]> {
-    return generatorRunAsync(this.privateEnforce(true, true, ...rvals));
+    if (rvals[0] instanceof EnforceContext) {
+      const enforceContext: EnforceContext = rvals.shift();
+      return generatorRunAsync(this.privateEnforce(true, true, '', enforceContext, ...rvals));
+    }
+    return generatorRunAsync(this.privateEnforce(true, true, '', this.defaultEnforceContext, ...rvals));
+  }
+
+  /**
+   * enforceExWithMatcher decides whether a "subject" can access a "object" with
+   * the operation "action" but with the matcher passed,
+   *  input parameters are usually: (matcher, sub, obj, act).
+   *
+   * @param matcher matcher string.
+   * @param rvals the request needs to be mediated, usually an array
+   *              of strings, can be class instances if ABAC is used.
+   * @return whether to allow the request and the reason rule.
+   */
+  public async enforceExWithMatcher(matcher: string, ...rvals: any[]): Promise<[boolean, string[]]> {
+    if (rvals[0] instanceof EnforceContext) {
+      const enforceContext: EnforceContext = rvals.shift();
+      return generatorRunAsync(this.privateEnforce(true, true, matcher, enforceContext, ...rvals));
+    }
+    return generatorRunAsync(this.privateEnforce(true, true, matcher, this.defaultEnforceContext, ...rvals));
+  }
+
+  /**
+   * batchEnforce enforces each request and returns result in a bool array.
+   * @param rvals the request need to be mediated, usually an array
+   *              of array of strings, can be class instances if ABAC is used.
+   * @returns whether to allow the requests.
+   */
+  public async batchEnforce(rvals: any[]): Promise<boolean[]> {
+    return await Promise.all(rvals.map((rval) => this.enforce(...rval)));
   }
 }

@@ -14,7 +14,7 @@
 
 import * as rbac from '../rbac';
 import { ip } from './ip';
-import * as picomatch from 'picomatch';
+import { minimatch } from 'minimatch';
 
 // regexMatch determines whether key1 matches the pattern of key2 in regular expression.
 function regexMatch(key1: string, key2: string): boolean {
@@ -46,6 +46,31 @@ function keyMatchFunc(...args: any[]): boolean {
   return keyMatch(name1, name2);
 }
 
+// KeyGet returns the matched part
+// For example, "/foo/bar/foo" matches "/foo/*"
+// "bar/foo" will been returned
+function keyGet(key1: string, key2: string): string {
+  const pos: number = key2.indexOf('*');
+  if (pos === -1) {
+    return '';
+  }
+  if (key1.length > pos) {
+    if (key1.slice(0, pos) === key2.slice(0, pos)) {
+      return key1.slice(pos, key1.length);
+    }
+  }
+  return '';
+}
+
+// keyGetFunc is the wrapper for keyGet.
+function keyGetFunc(...args: any[]): string {
+  const [arg0, arg1] = args;
+  const name1: string = (arg0 || '').toString();
+  const name2: string = (arg1 || '').toString();
+
+  return keyGet(name1, name2);
+}
+
 // keyMatch2 determines whether key1 matches the pattern of key2 (similar to RESTful path),
 // key2 can contain a *.
 // For example, '/foo/bar' matches '/foo/*', '/resource1' matches '/:resource'
@@ -73,6 +98,36 @@ function keyMatch2Func(...args: any[]): boolean {
   const name2: string = (arg1 || '').toString();
 
   return keyMatch2(name1, name2);
+}
+
+// KeyGet2 returns value matched pattern
+// For example, "/resource1" matches "/:resource"
+// if the pathVar == "resource", then "resource1" will be returned
+function keyGet2(key1: string, key2: string, pathVar: string): string {
+  if (keyMatch2(key1, key2)) {
+    const re = new RegExp('[^/]+', 'g');
+    const keys = key2.match(re);
+    const values = key1.match(re);
+    if (!keys || !values) {
+      return '';
+    }
+    const index = keys.indexOf(`:${pathVar}`);
+    if (index === -1) {
+      return '';
+    }
+    return values[index];
+  } else {
+    return '';
+  }
+}
+
+function keyGet2Func(...args: any[]): string {
+  const [arg0, arg1, arg2] = args;
+  const name1: string = (arg0 || '').toString();
+  const name2: string = (arg1 || '').toString();
+  const name3: string = (arg2 || '').toString();
+
+  return keyGet2(name1, name2, name3);
 }
 
 // keyMatch3 determines whether key1 matches the pattern of key2 (similar to RESTful path), key2 can contain a *.
@@ -178,6 +233,36 @@ function keyMatch4Func(...args: any[]): boolean {
   return keyMatch4(name1, name2);
 }
 
+// KeyMatch determines whether key1 matches the pattern of key2 and ignores the parameters in key2.
+// For example, "/foo/bar?status=1&type=2" matches "/foo/bar"
+function KeyMatch5(key1: string, key2: string): boolean {
+  const i: number = key1.indexOf('?');
+  if (i !== -1) {
+    key1 = key1.slice(0, i);
+  }
+
+  key2 = key2.replace(/\/\*/g, '/.*');
+
+  const regexp = new RegExp(/(.*){[^/]+}(.*)/g);
+  for (;;) {
+    if (!key2.includes('/{')) {
+      break;
+    }
+    key2 = key2.replace(regexp, '$1[^/]+$2');
+  }
+
+  return regexMatch(key1, '^' + key2 + '$');
+}
+
+// keyMatch5Func is the wrapper for KeyMatch5.
+function keyMatch5Func(...args: any[]): boolean {
+  const [arg0, arg1] = args;
+  const name1: string = (arg0 || '').toString();
+  const name2: string = (arg1 || '').toString();
+
+  return KeyMatch5(name1, name2);
+}
+
 // regexMatchFunc is the wrapper for regexMatch.
 function regexMatchFunc(...args: any[]): boolean {
   const [arg0, arg1] = args;
@@ -230,13 +315,18 @@ function ipMatchFunc(...args: any[]): boolean {
  * ```
  */
 function globMatch(string: string, pattern: string): boolean {
-  return picomatch(pattern)(string);
+  // The minimatch doesn't support the pattern starts with *
+  // See https://github.com/isaacs/minimatch/issues/195
+  if (pattern[0] === '*' && pattern[1] === '/') {
+    pattern = pattern.substring(1);
+  }
+  return minimatch(string, pattern);
 }
 
 // generateGFunction is the factory method of the g(_, _) function.
 function generateGFunction(rm: rbac.RoleManager): any {
   const memorized = new Map<string, boolean>();
-  return async function func(...args: any[]): Promise<boolean> {
+  return async function (...args: any[]): Promise<boolean> {
     const key = args.toString();
     let value = memorized.get(key);
     if (value) {
@@ -261,4 +351,47 @@ function generateGFunction(rm: rbac.RoleManager): any {
   };
 }
 
-export { keyMatchFunc, keyMatch2Func, keyMatch3Func, regexMatchFunc, ipMatchFunc, generateGFunction, keyMatch4Func, globMatch };
+// generateSyncedGFunction is the synchronous factory method of the g(_, _) function.
+function generateSyncedGFunction(rm: rbac.RoleManager): any {
+  const memorized = new Map<string, boolean>();
+  return function (...args: any[]): boolean {
+    const key = args.toString();
+    let value = memorized.get(key);
+    if (value) {
+      return value;
+    }
+
+    const [arg0, arg1] = args;
+    const name1: string = (arg0 || '').toString();
+    const name2: string = (arg1 || '').toString();
+
+    if (!rm) {
+      value = name1 === name2;
+    } else if (!rm?.syncedHasLink) {
+      throw new Error('RoleManager requires syncedHasLink for synchronous execution');
+    } else if (args.length === 2) {
+      value = rm.syncedHasLink(name1, name2);
+    } else {
+      const domain: string = args[2].toString();
+      value = rm.syncedHasLink(name1, name2, domain);
+    }
+
+    memorized.set(key, value);
+    return value;
+  };
+}
+
+export {
+  keyMatchFunc,
+  keyGetFunc,
+  keyMatch2Func,
+  keyGet2Func,
+  keyMatch3Func,
+  regexMatchFunc,
+  ipMatchFunc,
+  generateSyncedGFunction,
+  generateGFunction,
+  keyMatch4Func,
+  keyMatch5Func,
+  globMatch,
+};

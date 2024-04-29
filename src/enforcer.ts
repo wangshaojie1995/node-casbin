@@ -13,10 +13,11 @@
 // limitations under the License.
 
 import { ManagementEnforcer } from './managementEnforcer';
-import { Model, newModel } from './model';
-import { Adapter, FileAdapter, StringAdapter } from './persist';
+import { Model, newModelFromFile } from './model';
+import { Adapter, FileAdapter, getDefaultFileSystem, setDefaultFileSystem, StringAdapter } from './persist';
 import { getLogger } from './log';
 import { arrayRemoveDuplicates } from './util';
+import { FieldIndex } from './constants';
 
 /**
  * Enforcer = ManagementEnforcer + RBAC API.
@@ -26,30 +27,33 @@ export class Enforcer extends ManagementEnforcer {
    * initWithFile initializes an enforcer with a model file and a policy file.
    * @param modelPath model file path
    * @param policyPath policy file path
+   * @param lazyLoad lazyLoad whether to load policy at initial time
    */
-  public async initWithFile(modelPath: string, policyPath: string): Promise<void> {
-    const a = new FileAdapter(policyPath);
-    await this.initWithAdapter(modelPath, a);
+  public async initWithFile(modelPath: string, policyPath: string, lazyLoad = false): Promise<void> {
+    const a = new FileAdapter(policyPath, this.fs);
+    await this.initWithAdapter(modelPath, a, lazyLoad);
   }
 
   /**
    * initWithFile initializes an enforcer with a model file and a policy file.
    * @param modelPath model file path
    * @param policyString policy CSV string
+   * @param lazyLoad whether to load policy at initial time
    */
-  public async initWithString(modelPath: string, policyString: string): Promise<void> {
+  public async initWithString(modelPath: string, policyString: string, lazyLoad = false): Promise<void> {
     const a = new StringAdapter(policyString);
-    await this.initWithAdapter(modelPath, a);
+    await this.initWithAdapter(modelPath, a, lazyLoad);
   }
 
   /**
    * initWithAdapter initializes an enforcer with a database adapter.
    * @param modelPath model file path
    * @param adapter current adapter instance
+   * @param lazyLoad whether to load policy at initial time
    */
-  public async initWithAdapter(modelPath: string, adapter: Adapter): Promise<void> {
-    const m = newModel(modelPath, '');
-    await this.initWithModelAndAdapter(m, adapter);
+  public async initWithAdapter(modelPath: string, adapter: Adapter, lazyLoad = false): Promise<void> {
+    const m = newModelFromFile(modelPath, this.fs);
+    await this.initWithModelAndAdapter(m, adapter, lazyLoad);
 
     this.modelPath = modelPath;
   }
@@ -58,8 +62,9 @@ export class Enforcer extends ManagementEnforcer {
    * initWithModelAndAdapter initializes an enforcer with a model and a database adapter.
    * @param m model instance
    * @param adapter current adapter instance
+   * @param lazyLoad whether to load policy at initial time
    */
-  public async initWithModelAndAdapter(m: Model, adapter?: Adapter): Promise<void> {
+  public async initWithModelAndAdapter(m: Model, adapter?: Adapter, lazyLoad = false): Promise<void> {
     if (adapter) {
       this.adapter = adapter;
     }
@@ -67,7 +72,9 @@ export class Enforcer extends ManagementEnforcer {
     this.model = m;
     this.model.printModel();
 
-    if (this.adapter) {
+    this.initRmMap();
+
+    if (!lazyLoad && this.adapter) {
       await this.loadPolicy();
     }
   }
@@ -175,7 +182,8 @@ export class Enforcer extends ManagementEnforcer {
    */
   public async deleteRolesForUser(user: string, domain?: string): Promise<boolean> {
     if (domain === undefined) {
-      return this.removeFilteredGroupingPolicy(0, user);
+      const subIndex = this.getFieldIndex('p', FieldIndex.Subject);
+      return this.removeFilteredGroupingPolicy(subIndex, user);
     } else {
       return this.removeFilteredGroupingPolicy(0, user, '', domain);
     }
@@ -189,8 +197,9 @@ export class Enforcer extends ManagementEnforcer {
    * @return succeeds or not.
    */
   public async deleteUser(user: string): Promise<boolean> {
-    const res1 = await this.removeFilteredGroupingPolicy(0, user);
-    const res2 = await this.removeFilteredPolicy(0, user);
+    const subIndex = this.getFieldIndex('p', FieldIndex.Subject);
+    const res1 = await this.removeFilteredGroupingPolicy(subIndex, user);
+    const res2 = await this.removeFilteredPolicy(subIndex, user);
     return res1 || res2;
   }
 
@@ -202,8 +211,9 @@ export class Enforcer extends ManagementEnforcer {
    * @return succeeds or not.
    */
   public async deleteRole(role: string): Promise<boolean> {
-    const res1 = await this.removeFilteredGroupingPolicy(1, role);
-    const res2 = await this.removeFilteredPolicy(0, role);
+    const subIndex = this.getFieldIndex('p', FieldIndex.Subject);
+    const res1 = await this.removeFilteredGroupingPolicy(subIndex, role);
+    const res2 = await this.removeFilteredPolicy(subIndex, role);
     return res1 || res2;
   }
 
@@ -252,7 +262,8 @@ export class Enforcer extends ManagementEnforcer {
    * @return succeeds or not.
    */
   public async deletePermissionsForUser(user: string): Promise<boolean> {
-    return this.removeFilteredPolicy(0, user);
+    const subIndex = this.getFieldIndex('p', FieldIndex.Subject);
+    return this.removeFilteredPolicy(subIndex, user);
   }
 
   /**
@@ -262,7 +273,8 @@ export class Enforcer extends ManagementEnforcer {
    * @return the permissions, a permission is usually like (obj, act). It is actually the rule without the subject.
    */
   public async getPermissionsForUser(user: string): Promise<string[][]> {
-    return this.getFilteredPolicy(0, user);
+    const subIndex = this.getFieldIndex('p', FieldIndex.Subject);
+    return this.getFilteredPolicy(subIndex, user);
   }
 
   /**
@@ -337,6 +349,97 @@ export class Enforcer extends ManagementEnforcer {
   }
 
   /**
+   * getImplicitResourcesForUser returns all policies that user obtaining in domain.
+   */
+  public async getImplicitResourcesForUser(user: string, ...domain: string[]): Promise<string[][]> {
+    const permissions = await this.getImplicitPermissionsForUser(user, ...domain);
+    const res: string[][] = [];
+    for (const permission of permissions) {
+      if (permission[0] === user) {
+        res.push(permission);
+        continue;
+      }
+      let resLocal: string[][] = [[user]];
+      const tokensLength: number = permission.length;
+      const t: string[][] = [];
+      for (const token of permission) {
+        if (token === permission[0]) {
+          continue;
+        }
+        const tokens: string[] = await this.getImplicitUsersForRole(token, ...domain);
+        tokens.push(token);
+        t.push(tokens);
+      }
+      for (let i = 0; i < tokensLength - 1; i++) {
+        const n: string[][] = [];
+        for (const tokens of t[i]) {
+          for (const policy of resLocal) {
+            const t: string[] = [...policy];
+            t.push(tokens);
+            n.push(t);
+          }
+        }
+        resLocal = n;
+      }
+      res.push(...resLocal);
+    }
+    return res;
+  }
+
+  /**
+   * getImplicitUsersForRole gets implicit users that a role has.
+   * Compared to getUsersForRole(), this function retrieves indirect users besides direct users.
+   * For example:
+   * g, alice, role:admin
+   * g, role:admin, role:user
+   *
+   * getUsersForRole("user") can only get: ["role:admin"].
+   * But getImplicitUsersForRole("user") will get: ["role:admin", "alice"].
+   */
+  public async getImplicitUsersForRole(role: string, ...domain: string[]): Promise<string[]> {
+    const res = new Set<string>();
+    const q = [role];
+    let n: string | undefined;
+    while ((n = q.shift()) !== undefined) {
+      for (const rm of this.rmMap.values()) {
+        const user = await rm.getUsers(n, ...domain);
+        user.forEach((u) => {
+          if (!res.has(u)) {
+            res.add(u);
+            q.push(u);
+          }
+        });
+      }
+    }
+
+    return Array.from(res);
+  }
+
+  /**
+   * getRolesForUserInDomain gets the roles that a user has inside a domain
+   * An alias for getRolesForUser with the domain params.
+   *
+   * @param name the user.
+   * @param domain the domain.
+   * @return the roles that the user has.
+   */
+  public async getRolesForUserInDomain(name: string, domain: string): Promise<string[]> {
+    return this.getRolesForUser(name, domain);
+  }
+
+  /**
+   * getUsersForRoleInFomain gets the users that has a role inside a domain
+   * An alias for getUsesForRole with the domain params.
+   *
+   * @param name the role.
+   * @param domain the domain.
+   * @return the users that has the role.
+   */
+  public async getUsersForRoleInDomain(name: string, domain: string): Promise<string[]> {
+    return this.getUsersForRole(name, domain);
+  }
+
+  /**
    * getImplicitUsersForPermission gets implicit users for a permission.
    * For example:
    * p, admin, data1, read
@@ -364,6 +467,24 @@ export class Enforcer extends ManagementEnforcer {
 }
 
 export async function newEnforcerWithClass<T extends Enforcer>(enforcer: new () => T, ...params: any[]): Promise<T> {
+  // inject the FS
+  if (!getDefaultFileSystem()) {
+    try {
+      if (typeof process !== 'undefined' && process?.versions?.node) {
+        const fs = await import('fs');
+        const defaultFileSystem = {
+          readFileSync(path: string, encoding?: string) {
+            return fs.readFileSync(path, { encoding });
+          },
+          writeFileSync(path: string, text: string, encoding?: string) {
+            return fs.writeFileSync(path, text, encoding);
+          },
+        };
+        setDefaultFileSystem(defaultFileSystem);
+      }
+    } catch (ignored) {}
+  }
+
   const e = new enforcer();
 
   let parsedParamLen = 0;

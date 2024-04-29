@@ -18,6 +18,11 @@ import { Config, ConfigInterface } from '../config';
 import { Assertion } from './assertion';
 import { getLogger, logPrint } from '../log';
 import { DefaultRoleManager } from '../rbac';
+import { EffectExpress, FieldIndex } from '../constants';
+import { FileSystem } from '../persist/fileSystem';
+
+const defaultDomain = '';
+const defaultSeparator = '::';
 
 export const sectionNameMap: { [index: string]: string } = {
   r: 'request_definition',
@@ -80,6 +85,7 @@ export class Model {
     const ast = new Assertion();
     ast.key = key;
     ast.value = value;
+    ast.fieldIndexMap = new Map<string, number>();
 
     if (sec === 'r' || sec === 'p') {
       const tokens = value.split(',').map((n) => n.trim());
@@ -120,9 +126,23 @@ export class Model {
     return true;
   }
 
-  // loadModel loads the model from model CONF file.
-  public loadModel(path: string): void {
-    const cfg = Config.newConfig(path);
+  /**
+   * loadModel loads the model from model CONF file.
+   * @param path the model file path
+   * @param fs {@link FileSystem}
+   * @deprecated {@link loadModelFromFile}
+   */
+  public loadModel(path: string, fs?: FileSystem): void {
+    this.loadModelFromFile(path, fs);
+  }
+
+  /**
+   * loadModelFromFile loads the model from model CONF file.
+   * @param path the model file path
+   * @param fs {@link FileSystem}
+   */
+  public loadModelFromFile(path: string, fs?: FileSystem): void {
+    const cfg = Config.newConfigFromFile(path, fs);
 
     this.loadModelFromConfig(cfg);
   }
@@ -231,7 +251,7 @@ export class Model {
       const policy = ast.policy;
       const tokens = ast.tokens;
 
-      const priorityIndex = tokens.indexOf('p_priority');
+      const priorityIndex = tokens.indexOf(`${key}_priority`);
 
       if (priorityIndex !== -1) {
         const priorityRule = rule[priorityIndex];
@@ -264,7 +284,7 @@ export class Model {
       }
     }
 
-    const priorityFlag = ast.tokens.indexOf('p_priority') !== -1;
+    const priorityFlag = ast.tokens.indexOf(`${ptype}_priority`) !== -1;
 
     if (priorityFlag) {
       rules.forEach((rule) => {
@@ -289,7 +309,7 @@ export class Model {
       return false;
     }
 
-    const priorityIndex = ast.tokens.indexOf('p_priority');
+    const priorityIndex = ast.tokens.indexOf(`${ptype}_priority`);
 
     if (priorityIndex !== -1) {
       if (oldRule[priorityIndex] === newRule[priorityIndex]) {
@@ -449,6 +469,118 @@ export class Model {
       }
     });
   }
+
+  /**
+   * return the field index in fieldMap, if no this field in fieldMap, add it.
+   */
+  public getFieldIndex(ptype: string, field: string): number {
+    const assertion = this.model.get('p')?.get(ptype);
+    if (!assertion) {
+      return -1;
+    }
+
+    let index = assertion.fieldIndexMap.get(field);
+    if (index) {
+      return index;
+    }
+
+    const pattern = ptype + '_' + field;
+    index = -1;
+    for (let i = 0; i < assertion.tokens.length; i++) {
+      if (assertion.tokens[i] === pattern) {
+        index = i;
+        break;
+      }
+    }
+    if (index === -1) {
+      return index;
+    }
+    assertion.fieldIndexMap.set(field, index);
+    return index;
+  }
+
+  /**
+   * sort policies by subject hieraichy
+   */
+  public sortPoliciesBySubjectHierarchy(): void {
+    if (this.model.get('e')?.get('e')?.value !== EffectExpress.SUBJECT_PRIORITY) {
+      return;
+    }
+
+    this.model.get('p')?.forEach((assertion, ptype) => {
+      const domainIndex = this.getFieldIndex(ptype, FieldIndex.Domain);
+      const subIndex = this.getFieldIndex(ptype, FieldIndex.Subject);
+      // eslint-disable-next-line
+      const subjectHierarchyMap = this.getSubjectHierarchyMap(this.model.get('g')!.get('g')!.policy);
+
+      assertion.policy.sort((policyA, policyB) => {
+        const domainA = domainIndex === -1 ? defaultDomain : policyA[domainIndex];
+        const domainB = domainIndex === -1 ? defaultDomain : policyB[domainIndex];
+        // eslint-disable-next-line
+        const priorityA = subjectHierarchyMap.get(this.getNameWithDomain(domainA, policyA[subIndex]))!;
+        // eslint-disable-next-line
+        const priorityB = subjectHierarchyMap.get(this.getNameWithDomain(domainB, policyB[subIndex]))!;
+        return priorityB - priorityA;
+      });
+    });
+  }
+
+  /**
+   * Calculate the priority of each policy store in Map<string, number>
+   */
+  getSubjectHierarchyMap(groupPolicies: string[][]): Map<string, number> {
+    const subjectHierarchyMap = new Map<string, number>();
+    if (!groupPolicies) {
+      return subjectHierarchyMap;
+    }
+
+    const policyMap = new Map<string, string>();
+    let domain = defaultDomain;
+
+    groupPolicies.forEach((policy) => {
+      if (policy.length !== 2) domain = policy[this.getFieldIndex('p', FieldIndex.Domain)];
+      const child = this.getNameWithDomain(domain, policy[this.getFieldIndex('p', FieldIndex.Subject)]);
+      const parent = this.getNameWithDomain(domain, policy[this.getFieldIndex('p', FieldIndex.Object)]);
+      policyMap.set(child, parent);
+      if (!subjectHierarchyMap.has(child)) {
+        subjectHierarchyMap.set(child, 0);
+      }
+      if (!subjectHierarchyMap.has(parent)) {
+        subjectHierarchyMap.set(parent, 0);
+      }
+      subjectHierarchyMap.set(child, 1);
+    });
+
+    const set = new Set<string>();
+    subjectHierarchyMap.forEach((_, key) => {
+      if (subjectHierarchyMap.get(key) !== 0) set.add(key);
+    });
+    while (set.size !== 0) {
+      for (const child of set.values()) {
+        this.findHierarchy(policyMap, subjectHierarchyMap, set, child);
+      }
+    }
+    return subjectHierarchyMap;
+  }
+
+  findHierarchy(policyMap: Map<string, string>, subjectHierarchyMap: Map<string, number>, set: Set<string>, child: string): void {
+    set.delete(child);
+    // eslint-disable-next-line
+    const parent = policyMap.get(child)!;
+
+    if (set.has(parent)) {
+      this.findHierarchy(policyMap, subjectHierarchyMap, set, parent);
+    }
+    // eslint-disable-next-line
+    subjectHierarchyMap.set(child, subjectHierarchyMap.get(parent)! + 10);
+  }
+
+  /**
+   * get full name with domain
+   */
+  getNameWithDomain(domain: string, name: string): string {
+    return domain + defaultSeparator + name;
+  }
 }
 
 /**
@@ -459,7 +591,7 @@ export function newModel(...text: string[]): Model {
 
   if (text.length === 2) {
     if (text[0] !== '') {
-      m.loadModel(text[0]);
+      m.loadModelFromFile(text[0]);
     }
   } else if (text.length === 1) {
     m.loadModelFromText(text[0]);
@@ -473,9 +605,11 @@ export function newModel(...text: string[]): Model {
 /**
  * newModelFromFile creates a model from a .CONF file.
  */
-export function newModelFromFile(path: string): Model {
+export function newModelFromFile(path: string, fs?: FileSystem): Model {
   const m = new Model();
-  m.loadModel(path);
+  if (path) {
+    m.loadModelFromFile(path, fs);
+  }
   return m;
 }
 

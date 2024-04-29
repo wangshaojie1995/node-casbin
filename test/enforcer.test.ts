@@ -12,9 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-import { readFileSync } from 'fs';
+import fs, { readFileSync } from 'fs';
 
-import { newModel, newEnforcer, Enforcer, FileAdapter, StringAdapter, Util } from '../src';
+import { EnforceContext, Enforcer, FileAdapter, newEnforceContext, newEnforcer, newModel, StringAdapter, Util } from '../src';
 
 async function testEnforce(e: Enforcer, sub: any, obj: string, act: string, res: boolean): Promise<void> {
   await expect(e.enforce(sub, obj, act)).resolves.toBe(res);
@@ -24,8 +24,12 @@ function testEnforceSync(e: Enforcer, sub: any, obj: string, act: string, res: b
   expect(e.enforceSync(sub, obj, act)).toBe(res);
 }
 
-async function testEnforceEx(e: Enforcer, sub: any, obj: string, act: string, res: [boolean, string[]]): Promise<void> {
-  await expect(e.enforceEx(sub, obj, act)).resolves.toEqual(res);
+async function testEnforceEx(e: Enforcer, sub: any, obj: string, act: string, res: [boolean, string[]], domain?: string): Promise<void> {
+  if (domain) {
+    await expect(e.enforceEx(sub, obj, domain, act)).resolves.toEqual(res);
+  } else {
+    await expect(e.enforceEx(sub, obj, act)).resolves.toEqual(res);
+  }
 }
 
 function testEnforceExSync(e: Enforcer, sub: any, obj: string, act: string, res: [boolean, string[]]): void {
@@ -579,6 +583,46 @@ test('test ABAC Scaling', async () => {
   await testEnforce(e, sub3, '/data2', 'write', false);
 });
 
+test('test ABAC multiple eval()', async () => {
+  const m = newModel();
+  m.addDef('r', 'r', 'sub, obj, act');
+  m.addDef('p', 'p', 'sub_rule_1, sub_rule_2, act');
+  m.addDef('e', 'e', 'some(where (p.eft == allow))');
+  m.addDef('m', 'm', 'eval(p.sub_rule_1) && eval(p.sub_rule_2) && r.act == p.act');
+
+  const policy = new StringAdapter(
+    `
+    p, r.sub > 50, r.obj > 50, read
+    `
+  );
+
+  const e = await newEnforcer(m, policy);
+  await testEnforce(e, 56, (98 as unknown) as string, 'read', true);
+  await testEnforce(e, 23, (67 as unknown) as string, 'read', false);
+  await testEnforce(e, 78, (34 as unknown) as string, 'read', false);
+});
+
+// https://github.com/casbin/node-casbin/issues/438
+test('test ABAC single eval() with r. in unexpected places', async () => {
+  const m = newModel();
+  m.addDef('r', 'r', 'sub, obj, act');
+  m.addDef('p', 'p', 'sub_rule, act');
+  m.addDef('e', 'e', 'some(where (p.eft == allow))');
+  m.addDef('m', 'm', 'eval(p.sub_rule) && r.act == p.act');
+
+  const policy = new StringAdapter(
+    `
+    p, !!r.sub.id && r.sub.id == r.obj.owner.id, read
+    `
+  );
+
+  const e = await newEnforcer(m, policy);
+  await testEnforce(e, { id: 3 }, ({ owner: { id: 3 } } as unknown) as string, 'read', true);
+  await testEnforce(e, {}, ({ owner: {} } as unknown) as string, 'read', false);
+  await testEnforce(e, { id: 3 }, ({ owner: {} } as unknown) as string, 'read', false);
+  await testEnforce(e, { id: 3 }, ({ owner: { id: 2 } } as unknown) as string, 'read', false);
+});
+
 test('TestEnforceSync', async () => {
   const m = newModel();
   m.addDef('r', 'r', 'sub, obj, act');
@@ -630,4 +674,166 @@ test('Test RBAC G2', async () => {
   const e = await newEnforcer('examples/rbac_g2_model.conf', 'examples/rbac_g2_policy.csv');
   expect(await e.enforce('alice', 'data1', 'read')).toBe(false);
   expect(await e.enforce('admin', 'data1', 'read')).toBe(true);
+});
+
+test('TestBatchEnforce', async () => {
+  const e = await newEnforcer('examples/basic_model.conf', 'examples/basic_policy.csv');
+  const requests: string[][] = [
+    ['alice', 'data1', 'read'],
+    ['bob', 'data2', 'write'],
+  ];
+  expect(await e.batchEnforce(requests)).toEqual([true, true]);
+});
+
+test('TestKeyGet2', async () => {
+  const e = await newEnforcer('examples/basic_keyget2_model.conf', 'examples/basic_keyget2_policy.csv');
+  expect(await e.enforce('alice', 'data')).toBe(false);
+  expect(await e.enforce('alice', '/data')).toBe(false);
+  expect(await e.enforce('alice', '/data/1')).toBe(true);
+});
+
+test('TestEnforceExWithRBACDenyModel', async () => {
+  const e = await newEnforcer('examples/rbac_with_deny_model.conf', 'examples/rbac_with_deny_policy.csv');
+  testEnforceEx(e, 'alice', 'data1', 'read', [true, ['alice', 'data1', 'read', 'allow']]);
+  testEnforceEx(e, 'bob', 'data2', 'write', [true, ['bob', 'data2', 'write', 'allow']]);
+  testEnforceEx(e, 'alice', 'data2', 'write', [false, ['alice', 'data2', 'write', 'deny']]);
+  testEnforceEx(e, 'data2_admin', 'data2', 'read', [true, ['data2_admin', 'data2', 'read', 'allow']]);
+  testEnforceEx(e, 'data2_admin', 'data2', 'write', [true, ['data2_admin', 'data2', 'write', 'allow']]);
+  testEnforceEx(e, 'data2_admin', 'data1', 'read', [false, []]);
+  testEnforceEx(e, 'data2_admin', 'data1', 'write', [false, []]);
+});
+
+test('TestEnforceExWithGlobModel', async () => {
+  const e = await newEnforcer('examples/glob_model.conf', 'examples/glob_policy.csv');
+  testEnforceEx(e, 'u1', '/foo/1', 'read', [true, ['u1', '/foo/*', 'read']]);
+  testEnforceEx(e, 'u2', '/foo1', 'read', [true, ['u2', '/foo*', 'read']]);
+  testEnforceEx(e, 'u3', '/foo/2', 'read', [false, []]);
+});
+
+test('TestEnforceExWithKeyMatchModel', async () => {
+  const e = await newEnforcer('examples/keymatch_model.conf', 'examples/keymatch_policy.csv');
+  testEnforceEx(e, 'alice', '/alice_data/1', 'GET', [true, ['alice', '/alice_data/*', 'GET']]);
+  testEnforceEx(e, 'bob', '/alice_data/1', 'POST', [false, []]);
+});
+
+test('TestEnforceExWithPriorityModel', async () => {
+  const e = await newEnforcer('examples/priority_model.conf', 'examples/priority_policy.csv');
+  testEnforceEx(e, 'alice', 'data1', 'read', [true, ['alice', 'data1', 'read', 'allow']]);
+  testEnforceEx(e, 'bob', 'data2', 'read', [true, ['data2_allow_group', 'data2', 'read', 'allow']]);
+  testEnforceEx(e, 'alice', 'data2', 'read', [false, []]);
+});
+
+test('TestSubjectPriority', async () => {
+  const e = await newEnforcer('examples/subject_priority_model.conf', 'examples/subject_priority_policy.csv');
+  testEnforceEx(e, 'jane', 'data1', 'read', [true, ['jane', 'data1', 'read', 'allow']]);
+  testEnforceEx(e, 'alice', 'data1', 'read', [true, ['alice', 'data1', 'read', 'allow']]);
+});
+
+test('TestSubjectPriorityWithDomain', async () => {
+  const e = await newEnforcer('examples/subject_priority_model_with_domain.conf', 'examples/subject_priority_policy_with_domain.csv');
+  testEnforceEx(e, 'alice', 'data1', 'write', [true, ['alice', 'data1', 'domain1', 'write', 'allow']], 'domain1');
+  testEnforceEx(e, 'bob', 'data2', 'write', [true, ['bob', 'data2', 'domain2', 'write', 'allow']], 'domain2');
+});
+
+test('TestEnforcerWithScopeFileSystem', async () => {
+  const e = await newEnforcer();
+  const defaultFileSystem = {
+    readFileSync(path: string, encoding?: string) {
+      return fs.readFileSync(path, { encoding });
+    },
+    writeFileSync(path: string, text: string, encoding?: string) {
+      return fs.writeFileSync(path, text, encoding);
+    },
+  };
+  e.setFileSystem(defaultFileSystem);
+  expect(e.getFileSystem()).toEqual(defaultFileSystem);
+  await e.initWithFile('examples/basic_model.conf', 'examples/basic_policy.csv', false);
+  await testEnforce(e, 'alice', 'data1', 'read', true);
+  await testEnforce(e, 'alice', 'data1', 'write', false);
+  await testEnforce(e, 'bob', 'data2', 'write', true);
+  await testEnforce(e, 'bob', 'data2', 'read', false);
+});
+
+test('TestEnforce Multiple policies config', async () => {
+  const m = newModel();
+  m.addDef('r', 'r2', 'sub, obj, act');
+  m.addDef('p', 'p2', 'sub, obj, act');
+  m.addDef('g', 'g', '_, _');
+  m.addDef('e', 'e2', 'some(where (p.eft == allow))');
+  m.addDef('m', 'm2', 'g(r2.sub, p2.sub) && r2.obj == p2.obj && r2.act == p2.act');
+  const a = new FileAdapter('examples/mulitple_policy.csv');
+
+  const e = await newEnforcer(m, a);
+
+  //const e = await getEnforcerWithPath(m);
+  const enforceContext = new EnforceContext('r2', 'p2', 'e2', 'm2');
+  await expect(e.enforce(enforceContext, 'alice', 'data1', 'read')).resolves.toStrictEqual(true);
+  await expect(e.enforce(enforceContext, 'bob', 'data2', 'write')).resolves.toStrictEqual(true);
+});
+
+test('new EnforceContext config', async () => {
+  const m = newModel();
+  m.addDef('r', 'r2', 'sub, obj, act');
+  m.addDef('p', 'p2', 'sub, obj, act');
+  m.addDef('g', 'g', '_, _');
+  m.addDef('e', 'e2', 'some(where (p.eft == allow))');
+  m.addDef('m', 'm2', 'g(r2.sub, p2.sub) && r2.obj == p2.obj && r2.act == p2.act');
+  const a = new FileAdapter('examples/mulitple_policy.csv');
+
+  const e = await newEnforcer(m, a);
+
+  //const e = await getEnforcerWithPath(m);
+  const enforceContext = newEnforceContext('2');
+  await expect(e.enforce(enforceContext, 'alice', 'data1', 'read')).resolves.toStrictEqual(true);
+  await expect(e.enforce(enforceContext, 'bob', 'data2', 'write')).resolves.toStrictEqual(true);
+});
+
+test('TestEnforceEX Multiple policies config', async () => {
+  const m = newModel();
+  m.addDef('r', 'r2', 'sub, obj, act');
+  m.addDef('p', 'p2', 'sub, obj, act');
+  m.addDef('g', 'g', '_, _');
+  m.addDef('e', 'e2', 'some(where (p.eft == allow))');
+  m.addDef('m', 'm2', 'g(r2.sub, p2.sub) && r2.obj == p2.obj && r2.act == p2.act');
+  const a = new FileAdapter('examples/mulitple_policy.csv');
+
+  const e = await newEnforcer(m, a);
+
+  //const e = await getEnforcerWithPath(m);
+  const enforceContext = new EnforceContext('r2', 'p2', 'e2', 'm2');
+  await expect(e.enforceEx(enforceContext, 'alice', 'data1', 'read')).resolves.toStrictEqual([true, ['alice', 'data1', 'read']]);
+  await expect(e.enforceEx(enforceContext, 'bob', 'data2', 'write')).resolves.toStrictEqual([true, ['bob', 'data2', 'write']]);
+});
+
+test('new EnforceContextEX config', async () => {
+  const m = newModel();
+  m.addDef('r', 'r2', 'sub, obj, act');
+  m.addDef('p', 'p2', 'sub, obj, act');
+  m.addDef('g', 'g', '_, _');
+  m.addDef('e', 'e2', 'some(where (p.eft == allow))');
+  m.addDef('m', 'm2', 'g(r2.sub, p2.sub) && r2.obj == p2.obj && r2.act == p2.act');
+  const a = new FileAdapter('examples/mulitple_policy.csv');
+
+  const e = await newEnforcer(m, a);
+
+  //const e = await getEnforcerWithPath(m);
+  const enforceContext = newEnforceContext('2');
+  await expect(e.enforceEx(enforceContext, 'alice', 'data1', 'read')).resolves.toStrictEqual([true, ['alice', 'data1', 'read']]);
+  await expect(e.enforceEx(enforceContext, 'bob', 'data2', 'write')).resolves.toStrictEqual([true, ['bob', 'data2', 'write']]);
+});
+
+test('TestEnforceWithMatcher', async () => {
+  const e = await newEnforcer('examples/rbac_model.conf', 'examples/rbac_policy.csv');
+  expect(await e.enforce('bob', 'data2', 'read')).toBe(false);
+  expect(await e.enforce('bob', 'data1', 'read')).toBe(false);
+  expect(await e.enforce('alice', 'data1', 'write')).toBe(false);
+  expect(await e.enforce('data2_admin', 'data1', 'read')).toBe(false);
+  expect(await e.enforce('data2_admin', 'data1', 'write')).toBe(false);
+  const m1 = 'g(r.sub, p.sub) && r.obj == p.obj';
+  expect(await e.enforceWithMatcher(m1, 'bob', 'data2', 'read')).toBe(true);
+  expect(await e.enforceWithMatcher(m1, 'alice', 'data1', 'write')).toBe(true);
+  const m2 = 'g(r.sub, p.sub)';
+  expect(await e.enforceWithMatcher(m2, 'bob', 'data1', 'read')).toBe(true);
+  expect(await e.enforceWithMatcher(m2, 'data2_admin', 'data1', 'read')).toBe(true);
+  expect(await e.enforceWithMatcher(m2, 'data2_admin', 'data1', 'write')).toBe(true);
 });

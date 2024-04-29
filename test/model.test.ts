@@ -11,8 +11,8 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
+// noinspection JSMismatchedCollectionQueryUpdate
 
-import * as _ from 'lodash';
 import { DefaultRoleManager, Enforcer, newEnforcer, newModel } from '../src';
 import { keyMatch2Func, keyMatch3Func, keyMatchFunc } from '../src/util';
 
@@ -235,8 +235,8 @@ function customFunction(key1: string, key2: string): boolean {
 }
 
 function customFunctionWrapper(...args: any[]): boolean {
-  const name1: string = _.toString(args[0]);
-  const name2: string = _.toString(args[1]);
+  const name1 = String(args[0]);
+  const name2 = String(args[1]);
 
   return customFunction(name1, name2);
 }
@@ -417,4 +417,33 @@ test('TestAllMatchModel', async () => {
   await testDomainEnforce(e, 'alice', 'domain1', '/book/1', 'write', false);
   await testDomainEnforce(e, 'alice', 'domain2', '/book/1', 'read', false);
   await testDomainEnforce(e, 'alice', 'domain2', '/book/1', 'write', true);
+});
+
+test('ABACModelWithInOperator', async () => {
+  const e = await newEnforcer('examples/in_operator_model.conf');
+
+  class TestRule1 {
+    public Owner: string;
+    public Doc: string;
+
+    constructor(Owner: string, Doc: string) {
+      this.Owner = Owner;
+      this.Doc = Doc;
+    }
+  }
+
+  class TestRule2 {
+    public Owner: string;
+    public Docs: Array<string>;
+
+    constructor(Owner: string, Doc: string[]) {
+      this.Owner = Owner;
+      this.Docs = Doc;
+    }
+  }
+
+  const rule1 = new TestRule1('alice', 'aa');
+  const rule2 = new TestRule2('alice', ['aa', 'bb']);
+
+  await expect(e.enforce(rule1, rule2)).resolves.toBe(true);
 });

@@ -13,8 +13,8 @@
 // limitations under the License.
 
 import { readFileSync } from 'fs';
-import { newEnforcer } from '../src/index';
-import { casbinJsGetPermissionForUser } from '../src/frontend';
+import { newEnforcer } from '../src';
+import { casbinJsGetPermissionForUser } from '../src';
 
 test('TestCasbinJsGetPermissionForUser', async () => {
   const e = await newEnforcer('examples/rbac_model.conf', 'examples/rbac_with_hierarchy_policy.csv');
@@ -24,10 +24,17 @@ test('TestCasbinJsGetPermissionForUser', async () => {
     throw new Error('Unexpected side affect.');
   }
   const received = JSON.parse(await casbinJsGetPermissionForUser(e, 'alice'));
-  const expectedModelStr = readFileSync('examples/rbac_model.conf').toString();
+  let expectedModelStr = readFileSync('examples/rbac_model.conf').toString();
+
+  // avoid the impact of line breaks changing to CRLF, when automatic conversion is enabled
+  expectedModelStr = expectedModelStr.replace(/\r\n/g, '\n');
+
   expect(received['m']).toBe(expectedModelStr.replace(/\n\n/g, '\n'));
   const expectedPoliciesStr = readFileSync('examples/rbac_with_hierarchy_policy.csv').toString();
-  const expectedPolicyItem = expectedPoliciesStr.split(RegExp(',|\n'));
+
+  let expectedPolicyItem = expectedPoliciesStr.split(RegExp(',|\n'));
+  expectedPolicyItem = expectedPolicyItem.filter((item) => item !== null && item.trim() !== '');
+
   let i = 0;
   for (const sArr of received['p']) {
     for (const s of sArr) {
